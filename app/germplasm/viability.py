@@ -9,6 +9,7 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
 from app.germplasm.inventory import InventoryService
 from app.germplasm.repository import GermplasmRepository, record, records
+from app.germplasm.results import LOW_VIABILITY_THRESHOLD, pool_counts
 
 
 class ViabilityService:
@@ -122,6 +123,9 @@ class ViabilityService:
             raise ValidationError("单个重复的检测粒数超过规程样本数")
         if int(data["observation_day"]) > int(protocol["duration_days"]):
             raise ValidationError("观察日超过规程持续天数")
+        total = int(data["normal_count"]) + int(data["abnormal_count"]) + int(data["dead_count"]) + int(data.get("fresh_count", 0))
+        if total != int(data["seeds_tested"]):
+            raise ValidationError("正常、异常、死亡和新鲜未发芽计数之和必须等于检测粒数")
         timestamp = to_storage(self.clock.now())
         try:
             cursor = self.connection.execute(
@@ -157,6 +161,26 @@ class ViabilityService:
         )
         return record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (count_id,)).fetchone()) or {}
 
+    def void_count(self, count_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """作废单条计数（如霉变、操作失误）；作废后不可恢复，只能重新录入。"""
+        existing = record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (count_id,)).fetchone())
+        if not existing:
+            raise ValidationError("计数记录不存在")
+        if existing["status"] == "voided":
+            raise ConflictError("该计数已经作废")
+        test = self.repository.require_test(int(existing["test_id"]))
+        if test["status"] != "running":
+            raise ConflictError("已经结束的检测不能作废计数")
+        reason = str(data.get("reason", "")).strip()
+        if len(reason) < 3:
+            raise ValidationError("作废计数时必须填写不少于三个字的原因")
+        timestamp = to_storage(self.clock.now())
+        self.connection.execute(
+            "UPDATE viability_counts SET status='voided',voided_at=?,voided_by=?,void_reason=? WHERE id=? AND status='valid'",
+            (timestamp, data["actor"], reason, count_id),
+        )
+        return record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (count_id,)).fetchone()) or {}
+
     def complete_test(self, test_id: int, data: dict[str, Any]) -> dict[str, Any]:
         test = self.repository.require_test(test_id)
         if int(test["version"]) != int(data["expected_version"]):
@@ -164,29 +188,70 @@ class ViabilityService:
         if test["status"] != "running":
             raise ConflictError("只有执行中的检测可以完成")
         protocol = self.repository.require_protocol(int(test["protocol_id"]))
-        latest_counts = self._latest_counts(test_id)
-        if len(latest_counts) != int(protocol["replicate_count"]):
-            raise ValidationError("每个规程重复都必须有最终计数", context={
-                "expected": protocol["replicate_count"], "actual": len(latest_counts)
+        adopted, excluded = self._adopted_counts(test_id)
+        replicate_count = int(protocol["replicate_count"])
+        present = {int(item["replicate_no"]) for item in adopted}
+        missing = [no for no in range(1, replicate_count + 1) if no not in present]
+        if missing:
+            raise ValidationError("每个规程重复都必须有有效的最终计数", context={
+                "expected": replicate_count, "adopted": sorted(present), "missing_replicates": missing,
             })
-        percentages = [100.0 * int(item["normal_count"]) / int(item["seeds_tested"]) for item in latest_counts]
-        germination = round(sum(percentages) / len(percentages), 2)
-        vigor_parts = [
-            100.0 * (int(item["normal_count"]) + 0.5 * int(item["fresh_count"])) / int(item["seeds_tested"])
-            for item in latest_counts
-        ]
-        vigor = round(sum(vigor_parts) / len(vigor_parts), 2)
+        result = pool_counts(adopted)
         timestamp = to_storage(self.clock.now())
         cursor = self.connection.execute(
             "UPDATE viability_tests SET status='completed',germination_percent=?,vigor_index=?,completed_at=?,"
             "performed_by=?,version=version+1,updated_at=? WHERE id=? AND version=? AND status='running'",
-            (germination, vigor, timestamp, data["performed_by"], timestamp, test_id, data["expected_version"]),
+            (
+                result["germination_percent"], result["vigor_index"], timestamp, data["performed_by"], timestamp,
+                test_id, data["expected_version"],
+            ),
         )
         if cursor.rowcount != 1:
             raise ConflictError("检测任务版本冲突")
-        self._schedule_next(test_id, germination, timestamp)
-        if germination < 50:
-            self._create_low_viability_alert(test_id, germination, timestamp)
+        adopted_ids = [int(item["id"]) for item in adopted]
+        excluded_payload = [
+            {"count_id": int(item["id"]), "replicate_no": int(item["replicate_no"]),
+             "observation_day": int(item["observation_day"]), "reason": item.get("void_reason", "")}
+            for item in excluded
+        ]
+        calc = {
+            "aggregation": "sum_normal_over_sum_tested",
+            "selection": "latest_valid_observation_day_per_replicate",
+            "low_viability_threshold": LOW_VIABILITY_THRESHOLD,
+            "low_viability_alert": result["low_viability_alert"],
+            "class_totals": {
+                "normal": result["normal_total"], "abnormal": result["abnormal_total"],
+                "dead": result["dead_total"], "fresh": result["fresh_total"],
+            },
+            "per_replicate": [
+                {"replicate_no": int(item["replicate_no"]), "observation_day": int(item["observation_day"]),
+                 "seeds_tested": int(item["seeds_tested"]), "normal_count": int(item["normal_count"]),
+                 "fresh_count": int(item.get("fresh_count", 0))}
+                for item in adopted
+            ],
+        }
+        import json
+        try:
+            result_cursor = self.connection.execute(
+                "INSERT INTO viability_results(test_id,rule_version,numerator_seeds,denominator_seeds,"
+                "vigor_numerator_seeds,germination_percent,vigor_index,risk_level,adopted_counts_json,"
+                "excluded_counts_json,calc_json,computed_by,computed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    test_id, result["rule_version"], result["numerator_seeds"], result["denominator_seeds"],
+                    result["vigor_numerator_seeds"], result["germination_percent"], result["vigor_index"],
+                    result["risk_level"], json.dumps(adopted_ids), json.dumps(excluded_payload, ensure_ascii=False),
+                    json.dumps(calc, ensure_ascii=False), data["performed_by"], timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # UNIQUE(test_id)：并发/重复完成时只允许一份结果生效
+            raise ConflictError("该检测已经存在生效结果，不能重复计算") from exc
+        persisted = self.repository.require_result(int(result_cursor.lastrowid))
+        # 告警与复检日程必须使用同一份已持久化结果，不接受各自重算
+        self._schedule_next(test_id, persisted, timestamp)
+        if result["low_viability_alert"]:
+            self._create_low_viability_alert(test_id, persisted, timestamp)
         return self.repository.test_detail(test_id)
 
     def invalidate_test(self, test_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -201,7 +266,7 @@ class ViabilityService:
             (data["reason"], timestamp, test_id, data["expected_version"]),
         )
         self.connection.execute(
-            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE source_test_id=? AND status IN ('pending','notified')",
+            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE source_test_id=? AND status IN ('pending','notified','scheduled')",
             (timestamp, test_id),
         )
         return self.repository.test_detail(test_id)
@@ -243,44 +308,81 @@ class ViabilityService:
         )
         return int(cursor.rowcount)
 
-    def _latest_counts(self, test_id: int) -> list[dict[str, Any]]:
-        rows = self.connection.execute(
-            "SELECT c.* FROM viability_counts c JOIN (SELECT replicate_no,MAX(observation_day) AS day "
-            "FROM viability_counts WHERE test_id=? GROUP BY replicate_no) latest "
-            "ON latest.replicate_no=c.replicate_no AND latest.day=c.observation_day WHERE c.test_id=? "
-            "ORDER BY c.replicate_no",
-            (test_id, test_id),
-        ).fetchall()
-        return records(rows)
+    def _adopted_counts(self, test_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """选取每个重复最终观察日上的有效计数，并返回被排除的作废/过期计数。
 
-    def _schedule_next(self, test_id: int, germination: float, timestamp: str) -> None:
+        - 同一重复多个观察日：只采用观察日序号最大的一天；
+        - 作废计数（status='voided'）不参与分子分母；
+        - 若最终观察日的计数被作废，该重复视为缺少有效最终计数。
+        """
+        rows = records(self.connection.execute(
+            "SELECT * FROM viability_counts WHERE test_id=? ORDER BY replicate_no,observation_day,id",
+            (test_id,),
+        ).fetchall())
+        valid = [item for item in rows if item["status"] == "valid"]
+        latest_day: dict[int, int] = {}
+        for item in valid:
+            replicate_no = int(item["replicate_no"])
+            day = int(item["observation_day"])
+            if replicate_no not in latest_day or day > latest_day[replicate_no]:
+                latest_day[replicate_no] = day
+        adopted = [
+            item for item in valid
+            if int(item["observation_day"]) == latest_day[int(item["replicate_no"])]
+        ]
+        adopted_ids = {int(item["id"]) for item in adopted}
+        excluded = [item for item in rows if int(item["id"]) not in adopted_ids]
+        return adopted, excluded
+
+    def _schedule_next(self, test_id: int, result: dict[str, Any], timestamp: str) -> None:
         test = self.repository.require_test(test_id)
         lot = self.repository.require_lot(int(test["lot_id"]))
         accession = self.repository.require_accession(int(lot["accession_id"]))
-        risk = "high" if germination < 70 else ("medium" if germination < 85 else "low")
+        risk = result["risk_level"]
+        germination = float(result["germination_percent"])
         completed_date = datetime.fromisoformat(timestamp).date()
         policy = self.repository.applicable_policy(accession["crop_name"], risk, completed_date.isoformat())
         if policy is None:
             return
-        due = add_months(completed_date, int(policy["interval_months"]))
         self.connection.execute(
-            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE lot_id=? AND status IN ('pending','notified')",
+            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE lot_id=? "
+            "AND status IN ('pending','notified','scheduled')",
             (timestamp, lot["id"]),
         )
+        due = add_months(completed_date, int(policy["interval_months"]))
         self.connection.execute(
-            "INSERT INTO retest_schedules(lot_id,source_test_id,policy_id,due_on,status,reason,created_at,updated_at) "
-            "VALUES(?,?,?,?,'pending',?,?,?)",
-            (lot["id"], test_id, policy["id"], due.isoformat(), f"检测结果 {germination:.2f}% 对应 {risk} 风险", timestamp, timestamp),
+            "INSERT INTO retest_schedules(lot_id,source_test_id,source_result_id,policy_id,due_on,status,risk_level,"
+            "reason,created_at,updated_at) VALUES(?,?,?,?,?, 'pending',?,?,?,?)",
+            (
+                lot["id"], test_id, result["id"], policy["id"], due.isoformat(), risk,
+                f"检测结果 {germination:.2f}%（{result['numerator_seeds']}/{result['denominator_seeds']}，"
+                f"规则 {result['rule_version']}）对应 {risk} 风险",
+                timestamp, timestamp,
+            ),
         )
 
-    def _create_low_viability_alert(self, test_id: int, germination: float, timestamp: str) -> None:
+    def _create_low_viability_alert(self, test_id: int, result: dict[str, Any], timestamp: str) -> None:
         test = self.repository.require_test(test_id)
         key = f"low-viability-{test_id}"
         import json
+        detail = {
+            "test_id": test_id,
+            "result_id": result["id"],
+            "value": float(result["germination_percent"]),
+            "numerator_seeds": result["numerator_seeds"],
+            "denominator_seeds": result["denominator_seeds"],
+            "rule_version": result["rule_version"],
+            "threshold": LOW_VIABILITY_THRESHOLD,
+        }
         self.connection.execute(
             "INSERT OR IGNORE INTO quality_alerts(alert_key,alert_type,severity,lot_id,message,detail_json,created_at,updated_at) "
             "VALUES(?,'low_viability','critical',?,?,?,?,?)",
-            (key, test["lot_id"], f"批次活力降至 {germination:.2f}%", json.dumps({"test_id": test_id, "value": germination}), timestamp, timestamp),
+            (
+                key, test["lot_id"],
+                f"批次活力降至 {float(result['germination_percent']):.2f}%"
+                f"（{result['numerator_seeds']}/{result['denominator_seeds']} 粒）",
+                json.dumps(detail, ensure_ascii=False), timestamp, timestamp,
+            ),
         )
 
 

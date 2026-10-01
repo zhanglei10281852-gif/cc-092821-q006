@@ -241,6 +241,11 @@ class TestComplete(BaseModel):
     performed_by: str = Field(min_length=1, max_length=100)
 
 
+class CountVoid(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class TestInvalidate(BaseModel):
     expected_version: int = Field(gt=0)
     reason: str = Field(min_length=3, max_length=500)

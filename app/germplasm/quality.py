@@ -232,11 +232,13 @@ class DistributionService:
 
     def _choose_lot(self, accession_id: int, quantity: float) -> dict[str, Any] | None:
         row = self.connection.execute(
-            "SELECT l.*,v.germination_percent,v.completed_at FROM seed_lots l "
-            "LEFT JOIN viability_tests v ON v.id=(SELECT id FROM viability_tests WHERE lot_id=l.id AND status='completed' "
-            "ORDER BY completed_at DESC,id DESC LIMIT 1) WHERE l.accession_id=? AND l.status='stored' "
+            "SELECT l.*,r.germination_percent,r.id AS viability_result_id,t.completed_at FROM seed_lots l "
+            "LEFT JOIN viability_tests t ON t.id=(SELECT id FROM viability_tests WHERE lot_id=l.id AND status='completed' "
+            "ORDER BY completed_at DESC,id DESC LIMIT 1) "
+            "LEFT JOIN viability_results r ON r.test_id=t.id "
+            "WHERE l.accession_id=? AND l.status='stored' "
             "AND l.available_weight_grams>=? AND NOT EXISTS(SELECT 1 FROM lot_holds h WHERE h.lot_id=l.id AND h.released_at IS NULL) "
-            "ORDER BY CASE WHEN v.germination_percent IS NULL THEN 1 ELSE 0 END,v.completed_at,l.harvest_year,l.lot_no LIMIT 1",
+            "ORDER BY CASE WHEN r.germination_percent IS NULL THEN 1 ELSE 0 END,t.completed_at,l.harvest_year,l.lot_no LIMIT 1",
             (accession_id, quantity),
         ).fetchone()
         return record(row)

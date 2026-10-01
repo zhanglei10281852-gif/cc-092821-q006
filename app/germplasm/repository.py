@@ -12,6 +12,9 @@ JSON_COLUMNS = {
     "restrictions_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "adopted_counts_json": "adopted_counts",
+    "excluded_counts_json": "excluded_counts",
+    "calc_json": "calc",
 }
 
 
@@ -132,6 +135,8 @@ class GermplasmRepository:
             "SELECT * FROM viability_tests WHERE lot_id=? AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1",
             (lot_id,),
         ).fetchone())
+        if item["latest_viability"]:
+            item["latest_viability"]["result"] = self.result_for_test(int(item["latest_viability"]["id"]))
         return item
 
     def require_placement(self, placement_id: int) -> dict[str, Any]:
@@ -167,6 +172,18 @@ class GermplasmRepository:
         item["counts"] = records(self.connection.execute(
             "SELECT * FROM viability_counts WHERE test_id=? ORDER BY replicate_no,observation_day", (test_id,)
         ).fetchall())
+        item["result"] = self.result_for_test(test_id)
+        return item
+
+    def result_for_test(self, test_id: int) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM viability_results WHERE test_id=?", (test_id,)
+        ).fetchone())
+
+    def require_result(self, result_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM viability_results WHERE id=?", (result_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("活力检测结果不存在")
         return item
 
     def require_policy(self, policy_id: int) -> dict[str, Any]:

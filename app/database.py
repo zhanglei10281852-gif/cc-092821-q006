@@ -294,9 +294,30 @@ CREATE TABLE IF NOT EXISTS viability_counts (
     fresh_count INTEGER NOT NULL DEFAULT 0 CHECK(fresh_count >= 0),
     observation_day INTEGER NOT NULL CHECK(observation_day > 0),
     observed_by TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(test_id,replicate_no,observation_day)
+    status TEXT NOT NULL DEFAULT 'valid' CHECK(status IN ('valid','voided')),
+    voided_at TEXT,
+    voided_by TEXT,
+    void_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_counts_test ON viability_counts(test_id,replicate_no);
+CREATE TABLE IF NOT EXISTS viability_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id INTEGER NOT NULL UNIQUE REFERENCES viability_tests(id) ON DELETE RESTRICT,
+    rule_version TEXT NOT NULL,
+    numerator_seeds INTEGER NOT NULL CHECK(numerator_seeds >= 0),
+    denominator_seeds INTEGER NOT NULL CHECK(denominator_seeds >= 0),
+    vigor_numerator_seeds REAL NOT NULL CHECK(vigor_numerator_seeds >= 0),
+    germination_percent REAL NOT NULL,
+    vigor_index REAL NOT NULL,
+    risk_level TEXT NOT NULL CHECK(risk_level IN ('low','medium','high')),
+    adopted_counts_json TEXT NOT NULL,
+    excluded_counts_json TEXT NOT NULL DEFAULT '[]',
+    calc_json TEXT NOT NULL DEFAULT '{}',
+    computed_by TEXT NOT NULL,
+    computed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_results_risk ON viability_results(risk_level,computed_at);
 CREATE TABLE IF NOT EXISTS retest_policies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     crop_name TEXT NOT NULL,
@@ -315,9 +336,11 @@ CREATE TABLE IF NOT EXISTS retest_schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
     source_test_id INTEGER REFERENCES viability_tests(id),
+    source_result_id INTEGER REFERENCES viability_results(id) ON DELETE SET NULL,
     policy_id INTEGER NOT NULL REFERENCES retest_policies(id) ON DELETE RESTRICT,
     due_on TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','notified','scheduled','superseded','waived')),
+    risk_level TEXT CHECK(risk_level IS NULL OR risk_level IN ('low','medium','high')),
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -468,10 +491,39 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _apply_migrations(connection: sqlite3.Connection) -> None:
+    """对历史库做幂等的加列/加索引迁移，历史数据不被改写。"""
+    count_columns = _column_names(connection, "viability_counts")
+    for name, decl in (
+        ("status", "ALTER TABLE viability_counts ADD COLUMN status TEXT NOT NULL DEFAULT 'valid'"),
+        ("voided_at", "ALTER TABLE viability_counts ADD COLUMN voided_at TEXT"),
+        ("voided_by", "ALTER TABLE viability_counts ADD COLUMN voided_by TEXT"),
+        ("void_reason", "ALTER TABLE viability_counts ADD COLUMN void_reason TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in count_columns:
+            connection.execute(decl)
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_counts_active "
+        "ON viability_counts(test_id,replicate_no,observation_day) WHERE status='valid'"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_counts_test ON viability_counts(test_id,replicate_no)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_risk ON viability_results(risk_level,computed_at)")
+    schedule_columns = _column_names(connection, "retest_schedules")
+    if "source_result_id" not in schedule_columns:
+        connection.execute("ALTER TABLE retest_schedules ADD COLUMN source_result_id INTEGER REFERENCES viability_results(id)")
+    if "risk_level" not in schedule_columns:
+        connection.execute("ALTER TABLE retest_schedules ADD COLUMN risk_level TEXT")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _apply_migrations(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
