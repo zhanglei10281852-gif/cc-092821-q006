@@ -7,14 +7,14 @@ from fastapi.responses import JSONResponse
 
 from app.api import audit, auth, roles, system, users
 from app.core.errors import DomainError
-from app.database import close_connection, init_db
+from app.database import close_connection, migrate_db
 from app.germplasm.router import router as germplasm_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    init_db()
+    migrate_db()
     yield
     close_connection()
 

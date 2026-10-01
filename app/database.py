@@ -12,6 +12,10 @@ from app.core.clock import to_storage, utc_now
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "germplasm.db"
 _local = threading.local()
 
+# 历史检测回填结果时标记的旧计算规则（先算各重复百分比再平均）；新检测一律使用
+# app.germplasm.viability.RULE_VERSION 的汇总加权口径。
+LEGACY_RULE_VERSION = "v1.0-replicate-average (历史遗留)"
+
 SCHEMA = r'''
 CREATE TABLE IF NOT EXISTS departments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -294,9 +298,31 @@ CREATE TABLE IF NOT EXISTS viability_counts (
     fresh_count INTEGER NOT NULL DEFAULT 0 CHECK(fresh_count >= 0),
     observation_day INTEGER NOT NULL CHECK(observation_day > 0),
     observed_by TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(test_id,replicate_no,observation_day)
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','voided')),
+    void_reason TEXT NOT NULL DEFAULT '',
+    voided_by TEXT,
+    voided_at TEXT,
+    created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS viability_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id INTEGER NOT NULL UNIQUE REFERENCES viability_tests(id) ON DELETE CASCADE,
+    rule_version TEXT NOT NULL,
+    germination_percent REAL NOT NULL,
+    vigor_index REAL NOT NULL,
+    normal_total INTEGER NOT NULL CHECK(normal_total >= 0),
+    abnormal_total INTEGER NOT NULL CHECK(abnormal_total >= 0),
+    dead_total INTEGER NOT NULL CHECK(dead_total >= 0),
+    fresh_total INTEGER NOT NULL CHECK(fresh_total >= 0),
+    vigor_numerator REAL NOT NULL,
+    seeds_total INTEGER NOT NULL CHECK(seeds_total > 0),
+    risk_level TEXT NOT NULL CHECK(risk_level IN ('low','medium','high')),
+    adopted_counts_json TEXT NOT NULL DEFAULT '[]',
+    low_viability_alert_id INTEGER,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_results_lot ON viability_results(test_id);
 CREATE TABLE IF NOT EXISTS retest_policies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     crop_name TEXT NOT NULL,
@@ -512,3 +538,111 @@ def init_db() -> None:
 
 def migrate_db() -> None:
     init_db()
+    connection = get_connection()
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(viability_counts)").fetchall()}
+    if "status" not in columns:
+        _rebuild_counts_table(connection)
+    else:
+        # 新库由 SCHEMA 建表，部分唯一索引在此补齐（旧库则在重建时建立）。
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_viability_counts_active ON viability_counts"
+            "(test_id,replicate_no,observation_day) WHERE status='active'"
+        )
+    _backfill_results(connection)
+
+
+def _rebuild_counts_table(connection: sqlite3.Connection) -> None:
+    """旧表的 UNIQUE(test_id,replicate_no,observation_day) 与“作废留痕+追加新行”的订正模式冲突，重建为部分唯一索引。"""
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE viability_counts_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    test_id INTEGER NOT NULL REFERENCES viability_tests(id) ON DELETE CASCADE,
+                    replicate_no INTEGER NOT NULL,
+                    seeds_tested INTEGER NOT NULL CHECK(seeds_tested > 0),
+                    normal_count INTEGER NOT NULL CHECK(normal_count >= 0),
+                    abnormal_count INTEGER NOT NULL CHECK(abnormal_count >= 0),
+                    dead_count INTEGER NOT NULL CHECK(dead_count >= 0),
+                    fresh_count INTEGER NOT NULL DEFAULT 0 CHECK(fresh_count >= 0),
+                    observation_day INTEGER NOT NULL CHECK(observation_day > 0),
+                    observed_by TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','voided')),
+                    void_reason TEXT NOT NULL DEFAULT '',
+                    voided_by TEXT,
+                    voided_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO viability_counts_new(id,test_id,replicate_no,seeds_tested,normal_count,abnormal_count,
+                    dead_count,fresh_count,observation_day,observed_by,status,created_at)
+                SELECT id,test_id,replicate_no,seeds_tested,normal_count,abnormal_count,dead_count,
+                    COALESCE(fresh_count,0),observation_day,observed_by,'active',created_at FROM viability_counts;
+                DROP TABLE viability_counts;
+                ALTER TABLE viability_counts_new RENAME TO viability_counts;
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_viability_counts_active ON viability_counts"
+                "(test_id,replicate_no,observation_day) WHERE status='active'"
+            )
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _backfill_results(connection: sqlite3.Connection) -> None:
+    """为已完成的历史检测补建结果行：保留当时报告的百分比，标记为遗留规则版本，不静默改写历史数值。"""
+    import json
+
+    rows = connection.execute(
+        "SELECT t.id FROM viability_tests t WHERE t.status='completed' "
+        "AND NOT EXISTS(SELECT 1 FROM viability_results r WHERE r.test_id=t.id)"
+    ).fetchall()
+    for (test_id,) in rows:
+        latest = connection.execute(
+            "SELECT c.* FROM viability_counts c JOIN ("
+            "SELECT replicate_no,MAX(observation_day) AS day FROM viability_counts "
+            "WHERE test_id=? AND status='active' GROUP BY replicate_no) l "
+            "ON l.replicate_no=c.replicate_no AND l.day=c.observation_day "
+            "WHERE c.test_id=? AND c.status='active'",
+            (test_id, test_id),
+        ).fetchall()
+        if not latest:
+            continue
+        seeds_total = sum(int(r["seeds_tested"]) for r in latest)
+        normal_total = sum(int(r["normal_count"]) for r in latest)
+        abnormal_total = sum(int(r["abnormal_count"]) for r in latest)
+        dead_total = sum(int(r["dead_count"]) for r in latest)
+        fresh_total = sum(int(r["fresh_count"]) for r in latest)
+        test = connection.execute(
+            "SELECT germination_percent,vigor_index,performed_by,completed_at FROM viability_tests WHERE id=?",
+            (test_id,),
+        ).fetchone()
+        reported_germination = test["germination_percent"]
+        reported_vigor = test["vigor_index"]
+        if reported_germination is None or seeds_total <= 0:
+            continue
+        risk = "high" if reported_germination < 70 else ("medium" if reported_germination < 85 else "low")
+        adopted = [
+            {
+                "count_id": int(r["id"]), "replicate_no": int(r["replicate_no"]),
+                "observation_day": int(r["observation_day"]), "seeds_tested": int(r["seeds_tested"]),
+                "normal_count": int(r["normal_count"]), "abnormal_count": int(r["abnormal_count"]),
+                "dead_count": int(r["dead_count"]), "fresh_count": int(r["fresh_count"]),
+            }
+            for r in latest
+        ]
+        created_at = test["completed_at"] or to_storage(utc_now())
+        with connection:
+            connection.execute(
+                "INSERT INTO viability_results(test_id,rule_version,germination_percent,vigor_index,normal_total,"
+                "abnormal_total,dead_total,fresh_total,vigor_numerator,seeds_total,risk_level,adopted_counts_json,"
+                "created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    test_id, LEGACY_RULE_VERSION, reported_germination, reported_vigor,
+                    normal_total, abnormal_total, dead_total, fresh_total, normal_total + 0.5 * fresh_total,
+                    seeds_total, risk, json.dumps(adopted, ensure_ascii=False),
+                    test["performed_by"] or "migration", created_at,
+                ),
+            )

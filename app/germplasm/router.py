@@ -14,6 +14,7 @@ from app.germplasm.schemas import (
     AccessionTransition,
     AlertDecision,
     CountCreate,
+    CountVoid,
     DistributionCreate,
     DistributionDecision,
     HoldCreate,
@@ -248,6 +249,13 @@ def replace_count(count_id: int, data: CountCreate, principal: Principal = Depen
     principal.require("viability.write")
     with transaction(immediate=True) as connection:
         return GermplasmService(connection).viability.replace_count(count_id, data.model_dump(mode="json"))
+
+
+@router.post("/counts/{count_id}/void")
+def void_count(count_id: int, data: CountVoid, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("viability.write")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).viability.void_count(count_id, data.model_dump(mode="json"))
 
 
 @router.post("/tests/{test_id}/complete")

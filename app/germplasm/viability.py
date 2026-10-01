@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import json
 import sqlite3
 from datetime import date, datetime
 from typing import Any
@@ -9,6 +10,12 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
 from app.germplasm.inventory import InventoryService
 from app.germplasm.repository import GermplasmRepository, record, records
+
+# v1（历史遗留，仅迁移回填时使用，定义在 app/database.py）先算各重复百分比再取算术平均，
+# 重复样本量不同会失真；v2 以最终有效计数的总粒数为分母做汇总加权。
+RULE_VERSION = "v2.0-pooled-weighted"
+
+LOW_VIABILITY_THRESHOLD = 50.0
 
 
 class ViabilityService:
@@ -40,7 +47,6 @@ class ViabilityService:
             (data["idempotency_key"],),
         ).fetchone()
         if replay:
-            import json
             return self.repository.test_detail(int(json.loads(replay[0])["test_id"]))
         lot = self.repository.require_lot(int(data["lot_id"]))
         protocol = self.repository.require_protocol(int(data["protocol_id"]))
@@ -70,7 +76,6 @@ class ViabilityService:
         except sqlite3.IntegrityError as exc:
             raise ConflictError("检测编号已经存在") from exc
         test_id = int(cursor.lastrowid)
-        import json
         self.connection.execute(
             "INSERT INTO idempotency_records(scope,idempotency_key,request_hash,response_json,status_code,created_at) "
             "VALUES('viability.schedule',?,? ,?,201,?)",
@@ -116,12 +121,7 @@ class ViabilityService:
         if test["status"] != "running":
             raise ConflictError("只有执行中的检测可以录入计数")
         protocol = self.repository.require_protocol(int(test["protocol_id"]))
-        if int(data["replicate_no"]) > int(protocol["replicate_count"]):
-            raise ValidationError("重复编号超过规程规定的重复数")
-        if int(data["seeds_tested"]) > int(protocol["sample_size"]):
-            raise ValidationError("单个重复的检测粒数超过规程样本数")
-        if int(data["observation_day"]) > int(protocol["duration_days"]):
-            raise ValidationError("观察日超过规程持续天数")
+        self._validate_count_payload(data, protocol)
         timestamp = to_storage(self.clock.now())
         try:
             cursor = self.connection.execute(
@@ -134,28 +134,59 @@ class ViabilityService:
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            raise ConflictError("该重复在该观察日已经录入") from exc
-        return record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+            raise ConflictError("该重复在该观察日已经存在有效计数，请改用订正或作废") from exc
+        return record(self.connection.execute(
+            "SELECT * FROM viability_counts WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()) or {}
 
     def replace_count(self, count_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        existing = record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (count_id,)).fetchone())
-        if not existing:
-            raise ValidationError("计数记录不存在")
+        """订正计数：旧记录标记作废并原样保留，新记录作为有效计数追加，历史不被静默改写。"""
+        existing = self.repository.require_count(count_id)
+        if existing["status"] != "active":
+            raise ConflictError("已作废的计数不能订正，请重新录入")
         test = self.repository.require_test(int(existing["test_id"]))
         if test["status"] != "running":
             raise ConflictError("已经结束的检测不能修改计数")
-        total = int(data["normal_count"]) + int(data["abnormal_count"]) + int(data["dead_count"]) + int(data.get("fresh_count", 0))
-        if total != int(data["seeds_tested"]):
-            raise ValidationError("分类计数之和必须等于检测粒数")
+        protocol = self.repository.require_protocol(int(test["protocol_id"]))
+        self._validate_count_payload(data, protocol)
+        timestamp = to_storage(self.clock.now())
         self.connection.execute(
-            "UPDATE viability_counts SET seeds_tested=?,normal_count=?,abnormal_count=?,dead_count=?,fresh_count=?,"
-            "observation_day=?,observed_by=? WHERE id=?",
-            (
-                data["seeds_tested"], data["normal_count"], data["abnormal_count"], data["dead_count"],
-                data.get("fresh_count", 0), data["observation_day"], data["observed_by"], count_id,
-            ),
+            "UPDATE viability_counts SET status='voided',void_reason=?,voided_by=?,voided_at=? WHERE id=? AND status='active'",
+            (f"计数订正（PUT /counts/{count_id}）", data["observed_by"], timestamp, count_id),
         )
-        return record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (count_id,)).fetchone()) or {}
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO viability_counts(test_id,replicate_no,seeds_tested,normal_count,abnormal_count,dead_count,"
+                "fresh_count,observation_day,observed_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    test["id"], data["replicate_no"], data["seeds_tested"], data["normal_count"],
+                    data["abnormal_count"], data["dead_count"], data.get("fresh_count", 0),
+                    data["observation_day"], data["observed_by"], timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("该重复在该观察日已经存在有效计数") from exc
+        return record(self.connection.execute(
+            "SELECT * FROM viability_counts WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()) or {}
+
+    def void_count(self, count_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """作废单条计数：作废后不参与完成口径，但记录保留可追溯。"""
+        existing = self.repository.require_count(count_id)
+        if existing["status"] != "active":
+            raise ConflictError("该计数已经作废")
+        test = self.repository.require_test(int(existing["test_id"]))
+        if test["status"] != "running":
+            raise ConflictError("已经结束的检测不能作废计数")
+        timestamp = to_storage(self.clock.now())
+        cursor = self.connection.execute(
+            "UPDATE viability_counts SET status='voided',void_reason=?,voided_by=?,voided_at=? "
+            "WHERE id=? AND status='active'",
+            (data["reason"], data["actor"], timestamp, count_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("该计数已经作废")
+        return self.repository.require_count(count_id)
 
     def complete_test(self, test_id: int, data: dict[str, Any]) -> dict[str, Any]:
         test = self.repository.require_test(test_id)
@@ -164,19 +195,20 @@ class ViabilityService:
         if test["status"] != "running":
             raise ConflictError("只有执行中的检测可以完成")
         protocol = self.repository.require_protocol(int(test["protocol_id"]))
-        latest_counts = self._latest_counts(test_id)
-        if len(latest_counts) != int(protocol["replicate_count"]):
-            raise ValidationError("每个规程重复都必须有最终计数", context={
-                "expected": protocol["replicate_count"], "actual": len(latest_counts)
-            })
-        percentages = [100.0 * int(item["normal_count"]) / int(item["seeds_tested"]) for item in latest_counts]
-        germination = round(sum(percentages) / len(percentages), 2)
-        vigor_parts = [
-            100.0 * (int(item["normal_count"]) + 0.5 * int(item["fresh_count"])) / int(item["seeds_tested"])
-            for item in latest_counts
-        ]
-        vigor = round(sum(vigor_parts) / len(vigor_parts), 2)
+        active_rows = self.connection.execute(
+            "SELECT COUNT(*) FROM viability_counts WHERE test_id=? AND status='active'", (test_id,)
+        ).fetchone()[0]
+        if int(active_rows) == 0:
+            # 零有效样本：所有计数缺失或均已作废，不得产生百分比或风险结论。
+            raise ValidationError("没有有效计数（零有效样本），不能完成检测；请补录计数或作废检测")
+        adopted = self._adopted_counts(test_id, int(protocol["replicate_count"]))
+        totals = self._pooled_totals(adopted)
+        germination = round(100.0 * totals["normal_total"] / totals["seeds_total"], 2)
+        vigor = round(100.0 * totals["vigor_numerator"] / totals["seeds_total"], 2)
+        risk = risk_level(germination)
         timestamp = to_storage(self.clock.now())
+
+        # 条件更新保证并发完成只有一个结果生效；viability_results.test_id 唯一再加一道防线。
         cursor = self.connection.execute(
             "UPDATE viability_tests SET status='completed',germination_percent=?,vigor_index=?,completed_at=?,"
             "performed_by=?,version=version+1,updated_at=? WHERE id=? AND version=? AND status='running'",
@@ -184,9 +216,33 @@ class ViabilityService:
         )
         if cursor.rowcount != 1:
             raise ConflictError("检测任务版本冲突")
-        self._schedule_next(test_id, germination, timestamp)
-        if germination < 50:
-            self._create_low_viability_alert(test_id, germination, timestamp)
+
+        alert_id = self._create_low_viability_alert(test, germination, timestamp) if germination < LOW_VIABILITY_THRESHOLD else None
+        adopted_payload = [
+            {
+                "count_id": int(item["id"]),
+                "replicate_no": int(item["replicate_no"]),
+                "observation_day": int(item["observation_day"]),
+                "seeds_tested": int(item["seeds_tested"]),
+                "normal_count": int(item["normal_count"]),
+                "abnormal_count": int(item["abnormal_count"]),
+                "dead_count": int(item["dead_count"]),
+                "fresh_count": int(item["fresh_count"]),
+            }
+            for item in adopted
+        ]
+        self.connection.execute(
+            "INSERT INTO viability_results(test_id,rule_version,germination_percent,vigor_index,normal_total,"
+            "abnormal_total,dead_total,fresh_total,vigor_numerator,seeds_total,risk_level,adopted_counts_json,"
+            "low_viability_alert_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                test_id, RULE_VERSION, germination, vigor, totals["normal_total"], totals["abnormal_total"],
+                totals["dead_total"], totals["fresh_total"], totals["vigor_numerator"], totals["seeds_total"], risk,
+                json.dumps(adopted_payload, ensure_ascii=False), alert_id, data["performed_by"], timestamp,
+            ),
+        )
+        # 告警与复检策略都以同一份持久化结果为准。
+        self._schedule_next(test_id, germination, risk, timestamp)
         return self.repository.test_detail(test_id)
 
     def invalidate_test(self, test_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -196,12 +252,17 @@ class ViabilityService:
         if test["status"] not in {"running", "completed"}:
             raise ConflictError("当前检测状态不能作废")
         timestamp = to_storage(self.clock.now())
-        self.connection.execute(
-            "UPDATE viability_tests SET status='invalidated',invalid_reason=?,version=version+1,updated_at=? WHERE id=? AND version=?",
+        cursor = self.connection.execute(
+            "UPDATE viability_tests SET status='invalidated',invalid_reason=?,version=version+1,updated_at=? "
+            "WHERE id=? AND version=?",
             (data["reason"], timestamp, test_id, data["expected_version"]),
         )
+        if cursor.rowcount != 1:
+            raise ConflictError("检测任务版本冲突")
+        # 历史结果保留不删；派生日程失效，下游只认 status='completed' 的持久化结果。
         self.connection.execute(
-            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE source_test_id=? AND status IN ('pending','notified')",
+            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE source_test_id=? "
+            "AND status IN ('pending','notified','scheduled')",
             (timestamp, test_id),
         )
         return self.repository.test_detail(test_id)
@@ -226,8 +287,11 @@ class ViabilityService:
 
     def due_schedules(self, before: date, limit: int = 100) -> list[dict[str, Any]]:
         return records(self.connection.execute(
-            "SELECT s.*,l.lot_no,a.accession_no,a.crop_name FROM retest_schedules s "
+            "SELECT s.*,l.lot_no,a.accession_no,a.crop_name,"
+            "r.germination_percent AS result_germination_percent,r.risk_level,r.rule_version "
+            "FROM retest_schedules s "
             "JOIN seed_lots l ON l.id=s.lot_id JOIN accessions a ON a.id=l.accession_id "
+            "LEFT JOIN viability_results r ON r.test_id=s.source_test_id "
             "WHERE s.status IN ('pending','notified') AND s.due_on<=? ORDER BY s.due_on,l.lot_no LIMIT ?",
             (before.isoformat(), limit),
         ).fetchall())
@@ -243,45 +307,111 @@ class ViabilityService:
         )
         return int(cursor.rowcount)
 
-    def _latest_counts(self, test_id: int) -> list[dict[str, Any]]:
+    def _validate_count_payload(self, data: dict[str, Any], protocol: dict[str, Any]) -> None:
+        if int(data["replicate_no"]) > int(protocol["replicate_count"]):
+            raise ValidationError("重复编号超过规程规定的重复数")
+        if int(data["seeds_tested"]) > int(protocol["sample_size"]):
+            raise ValidationError("单个重复的检测粒数超过规程样本数")
+        if int(data["observation_day"]) > int(protocol["duration_days"]):
+            raise ValidationError("观察日超过规程持续天数")
+        total = (
+            int(data["normal_count"]) + int(data["abnormal_count"])
+            + int(data["dead_count"]) + int(data.get("fresh_count", 0))
+        )
+        if total != int(data["seeds_tested"]):
+            raise ValidationError("正常、异常、死亡和新鲜未发芽计数之和必须等于检测粒数", context={
+                "seeds_tested": data["seeds_tested"], "classified_total": total,
+            })
+
+    def _adopted_counts(self, test_id: int, replicate_count: int) -> list[dict[str, Any]]:
+        """每个重复只采用其最大观察日的有效计数；同一重复的早期观察日与作废计数均不进分母。"""
         rows = self.connection.execute(
-            "SELECT c.* FROM viability_counts c JOIN (SELECT replicate_no,MAX(observation_day) AS day "
-            "FROM viability_counts WHERE test_id=? GROUP BY replicate_no) latest "
-            "ON latest.replicate_no=c.replicate_no AND latest.day=c.observation_day WHERE c.test_id=? "
-            "ORDER BY c.replicate_no",
+            "SELECT c.* FROM viability_counts c JOIN ("
+            "SELECT replicate_no,MAX(observation_day) AS day FROM viability_counts "
+            "WHERE test_id=? AND status='active' GROUP BY replicate_no) latest "
+            "ON latest.replicate_no=c.replicate_no AND latest.day=c.observation_day "
+            "WHERE c.test_id=? AND c.status='active' ORDER BY c.replicate_no",
             (test_id, test_id),
         ).fetchall()
-        return records(rows)
+        adopted = records(rows)
+        found = {int(item["replicate_no"]) for item in adopted}
+        expected = set(range(1, replicate_count + 1))
+        missing = sorted(expected - found)
+        if missing:
+            raise ValidationError("每个规程重复都必须有最终有效计数", context={
+                "expected_replicates": replicate_count, "missing_replicates": missing,
+            })
+        extra = sorted(found - expected)
+        if extra:
+            raise ValidationError("存在超过规程重复数的计数", context={"extra_replicates": extra})
+        return adopted
 
-    def _schedule_next(self, test_id: int, germination: float, timestamp: str) -> None:
+    @staticmethod
+    def _pooled_totals(adopted: list[dict[str, Any]]) -> dict[str, int | float]:
+        # 重复样本量可以不同：先汇总分子分母再做除法，而不是对各重复百分比取平均。
+        seeds_total = sum(int(item["seeds_tested"]) for item in adopted)
+        normal_total = sum(int(item["normal_count"]) for item in adopted)
+        abnormal_total = sum(int(item["abnormal_count"]) for item in adopted)
+        dead_total = sum(int(item["dead_count"]) for item in adopted)
+        fresh_total = sum(int(item["fresh_count"]) for item in adopted)
+        return {
+            "seeds_total": seeds_total,
+            "normal_total": normal_total,
+            "abnormal_total": abnormal_total,
+            "dead_total": dead_total,
+            "fresh_total": fresh_total,
+            "vigor_numerator": normal_total + 0.5 * fresh_total,
+        }
+
+    def _schedule_next(self, test_id: int, germination: float, risk: str, timestamp: str) -> None:
         test = self.repository.require_test(test_id)
         lot = self.repository.require_lot(int(test["lot_id"]))
         accession = self.repository.require_accession(int(lot["accession_id"]))
-        risk = "high" if germination < 70 else ("medium" if germination < 85 else "low")
         completed_date = datetime.fromisoformat(timestamp).date()
         policy = self.repository.applicable_policy(accession["crop_name"], risk, completed_date.isoformat())
         if policy is None:
             return
         due = add_months(completed_date, int(policy["interval_months"]))
+        # 该批次此前所有活动日程（含本次检测排期时挂起的旧复检计划）统一由新结果取代。
         self.connection.execute(
-            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE lot_id=? AND status IN ('pending','notified')",
+            "UPDATE retest_schedules SET status='superseded',updated_at=? WHERE lot_id=? "
+            "AND status IN ('pending','notified','scheduled')",
             (timestamp, lot["id"]),
         )
         self.connection.execute(
             "INSERT INTO retest_schedules(lot_id,source_test_id,policy_id,due_on,status,reason,created_at,updated_at) "
-            "VALUES(?,?,?,?,'pending',?,?,?)",
-            (lot["id"], test_id, policy["id"], due.isoformat(), f"检测结果 {germination:.2f}% 对应 {risk} 风险", timestamp, timestamp),
+            "VALUES(?,?,?,?,'pending',?,?,?) ON CONFLICT(lot_id,due_on) DO UPDATE SET "
+            "source_test_id=excluded.source_test_id,policy_id=excluded.policy_id,status='pending',"
+            "reason=excluded.reason,updated_at=excluded.updated_at",
+            (lot["id"], test_id, policy["id"], due.isoformat(),
+             f"检测结果 {germination:.2f}%（{RULE_VERSION}）对应 {risk} 风险", timestamp, timestamp),
         )
 
-    def _create_low_viability_alert(self, test_id: int, germination: float, timestamp: str) -> None:
-        test = self.repository.require_test(test_id)
-        key = f"low-viability-{test_id}"
-        import json
-        self.connection.execute(
-            "INSERT OR IGNORE INTO quality_alerts(alert_key,alert_type,severity,lot_id,message,detail_json,created_at,updated_at) "
-            "VALUES(?,'low_viability','critical',?,?,?,?,?)",
-            (key, test["lot_id"], f"批次活力降至 {germination:.2f}%", json.dumps({"test_id": test_id, "value": germination}), timestamp, timestamp),
+    def _create_low_viability_alert(self, test: dict[str, Any], germination: float, timestamp: str) -> int:
+        key = f"low-viability-{test['id']}"
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO quality_alerts(alert_key,alert_type,severity,lot_id,message,detail_json,"
+            "created_at,updated_at) VALUES(?,'low_viability','critical',?,?,?,?,?)",
+            (
+                key, test["lot_id"], f"批次活力降至 {germination:.2f}%",
+                json.dumps({
+                    "test_id": test["id"], "value": germination, "rule_version": RULE_VERSION,
+                }, ensure_ascii=False),
+                timestamp, timestamp,
+            ),
         )
+        row = self.connection.execute(
+            "SELECT id FROM quality_alerts WHERE alert_key=?", (key,)
+        ).fetchone()
+        return int(row[0])
+
+
+def risk_level(germination: float) -> str:
+    if germination < 70:
+        return "high"
+    if germination < 85:
+        return "medium"
+    return "low"
 
 
 def add_months(value: date, months: int) -> date:

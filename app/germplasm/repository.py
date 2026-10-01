@@ -12,6 +12,7 @@ JSON_COLUMNS = {
     "restrictions_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "adopted_counts_json": "adopted_counts",
 }
 
 
@@ -128,10 +129,17 @@ class GermplasmRepository:
         item["holds"] = records(self.connection.execute(
             "SELECT * FROM lot_holds WHERE lot_id=? ORDER BY id", (lot_id,)
         ).fetchall())
-        item["latest_viability"] = record(self.connection.execute(
-            "SELECT * FROM viability_tests WHERE lot_id=? AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1",
+        latest_test = record(self.connection.execute(
+            "SELECT * FROM viability_tests WHERE lot_id=? AND status='completed' "
+            "AND EXISTS(SELECT 1 FROM viability_results r WHERE r.test_id=viability_tests.id) "
+            "ORDER BY completed_at DESC,id DESC LIMIT 1",
             (lot_id,),
         ).fetchone())
+        if latest_test is not None:
+            result = self.test_result(int(latest_test["id"])) or {}
+            latest_test["result"] = result
+            latest_test["risk_level"] = result.get("risk_level")
+        item["latest_viability"] = latest_test
         return item
 
     def require_placement(self, placement_id: int) -> dict[str, Any]:
@@ -160,13 +168,34 @@ class GermplasmRepository:
             raise NotFoundError("活力检测任务不存在")
         return item
 
+    def test_result(self, test_id: int) -> dict[str, Any] | None:
+        """返回检测唯一的持久化结果（分子、分母、采用计数、规则版本、风险等级）。"""
+        return record(self.connection.execute(
+            "SELECT * FROM viability_results WHERE test_id=?", (test_id,)
+        ).fetchone())
+
+    def require_count(self, count_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM viability_counts WHERE id=?", (count_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("计数记录不存在")
+        return item
+
     def test_detail(self, test_id: int) -> dict[str, Any]:
         item = self.require_test(test_id)
         item["lot"] = self.require_lot(int(item["lot_id"]))
         item["protocol"] = self.require_protocol(int(item["protocol_id"]))
         item["counts"] = records(self.connection.execute(
-            "SELECT * FROM viability_counts WHERE test_id=? ORDER BY replicate_no,observation_day", (test_id,)
+            "SELECT * FROM viability_counts WHERE test_id=? ORDER BY replicate_no,observation_day,id", (test_id,)
         ).fetchall())
+        result = self.test_result(test_id)
+        item["result"] = result
+        if result is not None:
+            # 汇总、明细、风险等级以同一份持久化结果为准，避免各接口各算各的。
+            item["germination_percent"] = result["germination_percent"]
+            item["vigor_index"] = result["vigor_index"]
+            item["risk_level"] = result["risk_level"]
+        else:
+            item["risk_level"] = None
         return item
 
     def require_policy(self, policy_id: int) -> dict[str, Any]:

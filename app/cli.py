@@ -7,17 +7,17 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.database import database_path, get_connection, init_db, transaction
+from app.database import database_path, get_connection, migrate_db, transaction
 from app.germplasm.service import GermplasmService
 
 
 def init_command() -> dict:
-    init_db()
+    migrate_db()
     return {"database": str(database_path()), "initialized": True}
 
 
 def check_command() -> dict:
-    init_db()
+    migrate_db()
     connection = get_connection()
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -40,7 +40,7 @@ def check_command() -> dict:
 def smoke_command() -> dict:
     from app.main import app
 
-    init_db()
+    migrate_db()
     with TestClient(app) as client:
         root = client.get("/")
         health = client.get("/api/system/health")
@@ -50,7 +50,7 @@ def smoke_command() -> dict:
 
 
 def demo_command() -> dict:
-    init_db()
+    migrate_db()
     service = GermplasmService(get_connection())
     suffix = get_connection().execute("SELECT COUNT(*) FROM accessions").fetchone()[0] + 1
     with transaction(immediate=True):
@@ -101,7 +101,7 @@ def demo_command() -> dict:
 
 
 def export_command(path: str) -> dict:
-    init_db()
+    migrate_db()
     service = GermplasmService(get_connection())
     items, total = service.repository.list_accessions(status=None, crop=None, limit=10_000, offset=0)
     target = Path(path).expanduser().resolve()
